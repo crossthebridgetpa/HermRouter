@@ -251,6 +251,7 @@ async function forwardToAnthropic(
   tier: string,
   res: ServerResponse,
   stream: boolean,
+  displayModel: string,
 ): Promise<void> {
   const auth = getAuth("anthropic");
   if (!auth?.token) throw new Error("No Anthropic auth token");
@@ -391,7 +392,7 @@ async function forwardToAnthropic(
       id: `chatcmpl-${Date.now()}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
-      model: `clawrouter/${modelName}`,
+      model: displayModel,
       choices: [{ index: 0, message, finish_reason: finishReason }],
       usage: {
         prompt_tokens: data.usage?.input_tokens ?? 0,
@@ -428,7 +429,7 @@ async function forwardToAnthropic(
     id: `chatcmpl-${Date.now()}`,
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
-    model: `clawrouter/${modelName}`,
+    model: displayModel,
     choices: [{ index: 0, delta, finish_reason: finish }],
   });
 
@@ -534,6 +535,7 @@ async function forwardToOpenAI(
   tier: string,
   res: ServerResponse,
   stream: boolean,
+  displayModel: string,
 ): Promise<void> {
   const auth = getAuth(provider);
   if (!auth?.apiKey) throw new Error(`No API key for ${provider}`);
@@ -541,15 +543,22 @@ async function forwardToOpenAI(
   const config = getProviderConfig(provider);
   if (!config) throw new Error(`Unknown provider: ${provider}`);
 
+  // Always request streaming upstream — some providers (e.g. PPQ) only emit
+  // usable payloads via SSE; non-streaming gets keepalive comments and no JSON.
+  // When the caller wanted non-streaming, we aggregate the stream below.
   const body: Record<string, unknown> = {
     model: modelName,
     messages: req.messages,
-    stream: stream,
+    stream: true,
   };
 
   if (req.max_tokens) body.max_tokens = req.max_tokens;
   if (req.temperature !== undefined) body.temperature = req.temperature;
   if (req.top_p !== undefined) body.top_p = req.top_p;
+  if (req.tools && req.tools.length > 0) {
+    body.tools = req.tools;
+    if (req.tool_choice !== undefined) body.tool_choice = req.tool_choice;
+  }
 
   const url = `${config.baseUrl}/chat/completions`;
   logger.info(`-> ${provider}: ${modelName} (tier=${tier}, stream=${stream})`);
@@ -591,10 +600,79 @@ async function forwardToOpenAI(
   clearTimeout(timeoutId);
 
   if (!stream) {
-    const data = await response.json() as Record<string, unknown>;
-    if (data.model) data.model = `clawrouter/${modelName}`;
+    // Caller wants a single JSON response but upstream is streaming.
+    // Consume the SSE stream and aggregate into a chat.completion object.
+    const aggReader = response.body?.getReader();
+    if (!aggReader) throw new Error("No response body");
+    const aggDecoder = new TextDecoder();
+    let aggBuffer = "";
+
+    let aggId = "";
+    let aggCreated = 0;
+    let aggRole = "assistant";
+    const contentParts: string[] = [];
+    const toolCalls: Array<{ id?: string; type: string; function: { name: string; arguments: string } }> = [];
+    let finishReason: string | null = null;
+    let usage: Record<string, unknown> | undefined;
+
+    const processAggLine = (line: string): void => {
+      if (!line.startsWith("data: ")) return;
+      const jsonStr = line.slice(6).trim();
+      if (!jsonStr || jsonStr === "[DONE]") return;
+      let chunk: any;
+      try { chunk = JSON.parse(jsonStr); } catch { return; }
+      if (chunk.id) aggId = chunk.id;
+      if (chunk.created) aggCreated = chunk.created;
+      if (chunk.usage) usage = chunk.usage;
+      const choice = chunk.choices?.[0];
+      if (!choice) return;
+      const delta = choice.delta ?? {};
+      if (delta.role) aggRole = delta.role;
+      if (typeof delta.content === "string") contentParts.push(delta.content);
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index ?? 0;
+          if (!toolCalls[idx]) {
+            toolCalls[idx] = { id: tc.id, type: tc.type ?? "function", function: { name: "", arguments: "" } };
+          }
+          if (tc.id) toolCalls[idx].id = tc.id;
+          if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
+          if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+        }
+      }
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+    };
+
+    try {
+      await readStreamWithStallDetection(aggReader, (value) => {
+        aggBuffer += aggDecoder.decode(value, { stream: true });
+        const lines = aggBuffer.split("\n");
+        aggBuffer = lines.pop() ?? "";
+        for (const line of lines) processAggLine(line);
+      }, abortController);
+      if (aggBuffer) processAggLine(aggBuffer);
+    } catch (err) {
+      if (err instanceof TimeoutError) {
+        logger.error(`\u23f1 STREAM STALL (aggregating): ${provider} ${modelName} - ${(err as Error).message}`);
+      }
+      throw err;
+    }
+
+    const message: Record<string, unknown> = { role: aggRole, content: contentParts.join("") };
+    const validToolCalls = toolCalls.filter(Boolean);
+    if (validToolCalls.length > 0) message.tool_calls = validToolCalls;
+
+    const aggregated = {
+      id: aggId || `clawrouter-${Date.now()}`,
+      object: "chat.completion",
+      created: aggCreated || Math.floor(Date.now() / 1000),
+      model: displayModel,
+      choices: [{ index: 0, message, finish_reason: finishReason ?? "stop" }],
+      ...(usage ? { usage } : {}),
+    };
+
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(data));
+    res.end(JSON.stringify(aggregated));
     return;
   }
 
@@ -626,7 +704,7 @@ async function forwardToOpenAI(
           }
           try {
             const chunk = JSON.parse(jsonStr);
-            if (chunk.model) chunk.model = `clawrouter/${modelName}`;
+            if (chunk.model) chunk.model = displayModel;
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           } catch {
             res.write(line + "\n");
@@ -668,9 +746,11 @@ export async function forwardRequest(
     throw new Error(`Unsupported provider: ${provider}`);
   }
 
+  const displayModel = `${tier}/${routedModel}`;
+
   if (providerConfig.api === "anthropic-messages") {
-    await forwardToAnthropic(chatReq, model, tier, res, stream);
+    await forwardToAnthropic(chatReq, model, tier, res, stream, displayModel);
   } else {
-    await forwardToOpenAI(chatReq, provider, model, tier, res, stream);
+    await forwardToOpenAI(chatReq, provider, model, tier, res, stream, displayModel);
   }
 }

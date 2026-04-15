@@ -1,9 +1,10 @@
 /**
- * ClawRouter Auth — loads API keys from OpenClaw auth-profiles.json
- * Zero-dep, reads from ~/.openclaw/agents/main/agent/auth-profiles.json
+ * FreeRouter Auth — loads credentials from Hermes Agent's credential pool
+ * (~/.hermes/auth.json). Zero-dep. Per-provider env-var overrides are still
+ * honored via freerouter.config.json (`providers.<name>.auth.type = "env"`).
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { getConfig } from "./config.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -12,80 +13,95 @@ import { logger } from "./logger.js";
 export type ProviderAuth = {
   provider: string;
   profileName: string;
-  token?: string;   // Anthropic OAuth token
-  apiKey?: string;   // API key (Kimi, OpenAI)
+  token?: string;   // OAuth access token (e.g. Anthropic via claude_code)
+  apiKey?: string;  // Long-lived API key (OpenAI-shaped providers)
 };
 
-type AuthProfilesFile = {
+type HermesCredential = {
+  id: string;
+  label?: string;
+  auth_type: "oauth" | "api_key";
+  priority?: number;
+  source?: string;
+  access_token?: string;
+  refresh_token?: string;
+  key?: string;
+  last_status?: string;
+  expires_at_ms?: number;
+};
+
+type HermesAuthFile = {
   version: number;
-  profiles: Record<string, {
-    type: "token" | "api_key";
-    provider: string;
-    token?: string;
-    key?: string;
-  }>;
-  lastGood?: Record<string, string>;
+  credential_pool?: Record<string, HermesCredential[]>;
 };
 
 let authCache: Map<string, ProviderAuth> | null = null;
 
-function loadAuthProfiles(): Map<string, ProviderAuth> {
-  // Get path from config, fall back to default
+function resolvePath(p: string): string {
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return p;
+}
+
+function pickBestCredential(entries: HermesCredential[]): HermesCredential | undefined {
+  if (!Array.isArray(entries) || entries.length === 0) return undefined;
+  const now = Date.now();
+
+  const viable = entries.filter(e => {
+    if (e.last_status === "error") return false;
+    if (e.auth_type === "oauth") {
+      if (!e.access_token) return false;
+      // Hermes refreshes in its own process; accept unexpired or unknown expiry.
+      if (e.expires_at_ms && e.expires_at_ms <= now) return false;
+      return true;
+    }
+    return e.auth_type === "api_key" && !!e.key;
+  });
+
+  viable.sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999));
+  return viable[0];
+}
+
+function loadFromHermes(): Map<string, ProviderAuth> {
   const cfg = getConfig();
   const authCfg = cfg.auth;
-  const defaultAuth = authCfg[authCfg.default] as { type?: string; profilesPath?: string } | undefined;
-  let filePath: string;
-  if (defaultAuth?.profilesPath) {
-    const p = defaultAuth.profilesPath;
-    filePath = p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
-  } else {
-    filePath = join(homedir(), ".openclaw", "agents", "main", "agent", "auth-profiles.json");
-  }
+  const defaultAuth = authCfg[authCfg.default] as { type?: string; authPath?: string } | undefined;
+  const filePath = resolvePath(defaultAuth?.authPath ?? "~/.hermes/auth.json");
+
   try {
     const raw = readFileSync(filePath, "utf-8");
-    const data: AuthProfilesFile = JSON.parse(raw);
+    const data: HermesAuthFile = JSON.parse(raw);
     const map = new Map<string, ProviderAuth>();
 
-    // Build a map of provider → best profile (prefer lastGood)
-    const lastGood = data.lastGood ?? {};
-
-    for (const [name, profile] of Object.entries(data.profiles)) {
-      const provider = profile.provider;
-      const existing = map.get(provider);
-
-      // Prefer lastGood profile
-      const isLastGood = lastGood[provider] === name;
-      if (existing && !isLastGood) continue;
+    for (const [provider, entries] of Object.entries(data.credential_pool ?? {})) {
+      const best = pickBestCredential(entries);
+      if (!best) continue;
 
       map.set(provider, {
         provider,
-        profileName: name,
-        token: profile.type === "token" ? profile.token : undefined,
-        apiKey: profile.type === "api_key" ? profile.key : undefined,
+        profileName: best.label ?? best.id,
+        token: best.auth_type === "oauth" ? best.access_token : undefined,
+        apiKey: best.auth_type === "api_key" ? best.key : undefined,
       });
     }
 
-    logger.info(`Loaded auth for providers: ${[...map.keys()].join(", ")}`);
+    logger.info(`Loaded Hermes auth for providers: ${[...map.keys()].join(", ") || "(none)"}`);
     return map;
   } catch (err) {
-    logger.error("Failed to load auth-profiles.json:", err);
+    logger.error(`Failed to load Hermes auth from ${filePath}:`, err);
     return new Map();
   }
 }
 
 export function getAuth(provider: string): ProviderAuth | undefined {
-  // Check env var auth first (per-provider config override)
+  // Per-provider env-var override takes precedence.
   const envAuth = getEnvAuth(provider);
   if (envAuth) return envAuth;
 
-  // Fall back to auth-profiles.json
   if (!authCache) {
-    authCache = loadAuthProfiles();
+    authCache = loadFromHermes();
   }
   return authCache.get(provider);
 }
-
-
 
 /**
  * Get auth from environment variable (for providers with auth.type=env in config).
@@ -116,13 +132,7 @@ export function reloadAuth(): void {
 export function getAuthHeader(provider: string): string | undefined {
   const auth = getAuth(provider);
   if (!auth) return undefined;
-
-  if (auth.token) {
-    // Anthropic uses x-api-key header, not Authorization
-    return auth.token;
-  }
-  if (auth.apiKey) {
-    return auth.apiKey;
-  }
+  if (auth.token) return auth.token;
+  if (auth.apiKey) return auth.apiKey;
   return undefined;
 }

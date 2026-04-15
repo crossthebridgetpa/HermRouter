@@ -8,7 +8,7 @@
  *   3. ~/.config/freerouter/config.json
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { logger } from "./logger.js";
@@ -16,9 +16,9 @@ import { logger } from "./logger.js";
 // ─── Config Types ───
 
 export type AuthConfig = {
-  type: "openclaw" | "env" | "file" | "keychain";
+  type: "hermes" | "env" | "file" | "keychain";
   key?: string;           // env var name for type=env
-  profilesPath?: string;  // for type=openclaw
+  authPath?: string;      // for type=hermes (~/.hermes/auth.json)
   filePath?: string;      // for type=file
   service?: string;       // for type=keychain
   account?: string;       // for type=keychain
@@ -47,6 +47,7 @@ export type FreeRouterConfig = {
   providers: Record<string, ProviderConfigEntry>;
   tiers: Record<string, TierMapping>;
   agenticTiers?: Record<string, TierMapping>;
+  visionTier?: TierMapping;
   tierBoundaries?: {
     simpleMedium: number;
     mediumComplex: number;
@@ -93,10 +94,10 @@ const DEFAULT_CONFIG: FreeRouterConfig = {
     enabled: { models: ["claude-sonnet-4-5"], budget: 4096 },
   },
   auth: {
-    default: "openclaw",
-    openclaw: {
-      type: "openclaw",
-      profilesPath: "~/.openclaw/agents/main/agent/auth-profiles.json",
+    default: "hermes",
+    hermes: {
+      type: "hermes",
+      authPath: "~/.hermes/auth.json",
     },
   },
 };
@@ -205,6 +206,20 @@ export function reloadConfig(): FreeRouterConfig {
 }
 
 /**
+ * Persist a new config to the active config file (or ./freerouter.config.json
+ * if running on built-in defaults), then reload into memory.
+ * Used by the web editor (PUT /config).
+ */
+export function writeConfig(newConfig: FreeRouterConfig): { path: string } {
+  const target = _configPath ?? join(process.cwd(), "freerouter.config.json");
+  writeFileSync(target, JSON.stringify(newConfig, null, 2) + "\n", "utf-8");
+  logger.info(`Wrote config to ${target}`);
+  _config = null;
+  loadConfig();
+  return { path: target };
+}
+
+/**
  * Get the current config (loads if not yet loaded).
  */
 export function getConfig(): FreeRouterConfig {
@@ -230,8 +245,8 @@ export function getSanitizedConfig(): Record<string, unknown> {
   if (sanitized.auth) {
     for (const [key, val] of Object.entries(sanitized.auth)) {
       if (key === "default") continue;
-      if (val && typeof val === "object" && (val as any).profilesPath) {
-        (val as any).profilesPath = "***";
+      if (val && typeof val === "object" && (val as any).authPath) {
+        (val as any).authPath = "***";
       }
     }
   }
