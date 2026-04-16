@@ -113,7 +113,7 @@ export async function getPpqSnapshot(): Promise<PpqSnapshot> {
       fetchedAt: new Date().toISOString(),
       balance,
       last24h: { totalUsd, requests, byModel },
-      recent: history.slice(0, 10),
+      recent: history,
     };
     cached = { at: Date.now(), snap };
     return snap;

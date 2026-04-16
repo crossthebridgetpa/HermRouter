@@ -428,6 +428,38 @@ async function handleStats(req: IncomingMessage, res: ServerResponse) {
     return bv - av;
   });
 
+  // Enrich recent routing decisions with actual PPQ costs by matching
+  // routing log entries to PPQ history rows (same model basename, timestamp within 10s).
+  type EnrichedEntry = typeof recent[number] & { ppqCostUsd?: number; ppqInTok?: number; ppqOutTok?: number };
+  const enriched: EnrichedEntry[] = recent.map(r => ({ ...r }));
+  if (!ppq.disabled && ppq.recent.length > 0) {
+    const ppqRows = ppq.recent.map(h => ({
+      ...h,
+      tsMs: Date.parse(h.timestamp),
+      base: h.model.split("/").pop() ?? h.model,
+    }));
+    for (const entry of enriched) {
+      const entryMs = Date.parse(entry.ts);
+      const entryBase = entry.routedModel.split("/").pop() ?? entry.routedModel;
+      // Find closest PPQ row with same model basename within 10s
+      let best: typeof ppqRows[number] | null = null;
+      let bestDiff = Infinity;
+      for (const p of ppqRows) {
+        if (p.base !== entryBase) continue;
+        const diff = Math.abs(p.tsMs - entryMs);
+        if (diff < bestDiff && diff < 10_000) {
+          best = p;
+          bestDiff = diff;
+        }
+      }
+      if (best) {
+        entry.ppqCostUsd = best.price_in_usd;
+        entry.ppqInTok = best.input_count;
+        entry.ppqOutTok = best.output_count;
+      }
+    }
+  }
+
   // Roll up the recent window so the UI can show "what's happening lately"
   // instead of process-lifetime totals.
   const windowByTier: Record<string, number> = {};
@@ -449,7 +481,7 @@ async function handleStats(req: IncomingMessage, res: ServerResponse) {
       byModel: windowByModel,
       byOverride: windowByOverride,
     },
-    recent,
+    recent: enriched,
     ppq,
     pinch: {
       fetchedAt: pinch.fetchedAt,
@@ -902,13 +934,19 @@ async function loadStats(){
       const conf=d.classifierConfidence==null?'—':(d.classifierConfidence*100).toFixed(0)+'%';
       const color=TIER_COLORS[d.tier]||'#9db2c7';
       const tr=document.createElement('tr');
-      const cost=d.estInputCostUsd!=null?'$'+d.estInputCostUsd.toFixed(4):'—';
+      const hasPpq=d.ppqCostUsd!=null;
+      const costVal=hasPpq?d.ppqCostUsd:d.estInputCostUsd;
+      const cost=costVal!=null?'$'+costVal.toFixed(4):'—';
+      const costColor=hasPpq?'#34d399':'#6b7280';
+      const costTitle=hasPpq
+        ?'PPQ actual: '+d.ppqInTok+' in / '+d.ppqOutTok+' out tokens'
+        :'estimate (input only, chars/4)';
       tr.innerHTML='<td>'+escHtml(tStr)+'</td>'+
         '<td style="color:'+color+';font-weight:600">'+escHtml(d.tier)+'</td>'+
         '<td>'+escHtml(d.routedModel)+'</td>'+
         '<td class="mprov">'+escHtml(d.override)+'</td>'+
         '<td style="text-align:right">'+conf+'</td>'+
-        '<td style="text-align:right;color:#34d399;font-variant-numeric:tabular-nums">'+cost+'</td>'+
+        '<td style="text-align:right;color:'+costColor+';font-variant-numeric:tabular-nums;cursor:help" title="'+costTitle+'">'+cost+'</td>'+
         '<td class="mprov" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escHtml(d.reasoning)+'">'+escHtml(d.reasoning)+'</td>';
       rows.appendChild(tr);
     }
