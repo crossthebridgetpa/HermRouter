@@ -296,7 +296,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
     if (imagesPresent && visionCfg?.primary) {
       routedModel = visionCfg.primary;
       tier = "VISION";
-      reasoning = "image content detected → visionTier";
+      reasoning = "image content detected -> visionTier";
       override = "vision";
       logger.info(`[${stats.requests + 1}] Vision override: model=${routedModel} | ${reasoning}`);
     } else {
@@ -342,7 +342,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
         const floorTierMap = (hasTools && routingCfg.agenticTiers) ? routingCfg.agenticTiers : routingCfg.tiers;
         const floorTierConfig = floorTierMap[tier as keyof typeof floorTierMap];
         if (floorTierConfig?.primary) routedModel = floorTierConfig.primary;
-        reasoning += ` | conv-floor: ${prevTier}→${tier} (${floorReason})`;
+        reasoning += ` | conv-floor: ${prevTier}->${tier} (${floorReason})`;
         override = "conv-floor" as RouteOverride;
       }
 
@@ -399,7 +399,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
   // Add routing info headers
   res.setHeader("X-ClawRouter-Model", routedModel);
   res.setHeader("X-ClawRouter-Tier", tier);
-  res.setHeader("X-ClawRouter-Reasoning", reasoning.slice(0, 200));
+  res.setHeader("X-ClawRouter-Reasoning", reasoning.slice(0, 200).replace(/[^\x20-\x7E]/g, "?"));
 
   // Build model list: primary + fallbacks
   const modelsToTry: string[] = [routedModel];
@@ -416,6 +416,21 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
       for (const fb of tierConfig.fallback) {
         if (fb !== routedModel) modelsToTry.push(fb);
       }
+    }
+  }
+
+  // Stream guard: drop stream-only providers when client asked for stream=false.
+  if (!stream) {
+    const providers = getConfig().providers;
+    const filtered = modelsToTry.filter((m) => {
+      const prov = m.split("/")[0];
+      return !providers[prov]?.streamOnly;
+    });
+    if (filtered.length < modelsToTry.length) {
+      const dropped = modelsToTry.filter((m) => !filtered.includes(m));
+      logger.info(`[${stats.requests}] stream=false — skipping stream-only candidates: ${dropped.join(", ")}`);
+      modelsToTry.length = 0;
+      modelsToTry.push(...filtered);
     }
   }
 

@@ -29,6 +29,8 @@ export type ProviderConfigEntry = {
   api: "anthropic" | "openai";
   headers?: Record<string, string>;
   auth?: AuthConfig;
+  /** If true, provider rejects non-streaming requests — candidates from this provider are skipped when client sent stream=false. */
+  streamOnly?: boolean;
 };
 
 export type TierMapping = {
