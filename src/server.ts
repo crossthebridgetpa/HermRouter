@@ -24,6 +24,8 @@ import { logRoutingDecision, readRecentDecisions, getLogPath, type RouteOverride
 import { getPpqSnapshot } from "./ppq-usage.js";
 import { getPinchbench, findPinchRow, collectConfiguredModels } from "./pinchbench.js";
 import { findPpqPrice, exampleRequestCost, blendedPricePerK } from "./ppq-pricing.js";
+import { canSpend, recordEstimatedCost, getSpendState } from "./spend-tracker.js";
+import { scoreBatch } from "./feedback.js";
 
 // Load config at startup
 const appConfig = loadConfig();
@@ -82,12 +84,34 @@ function hasImageContent(messages: ChatRequest["messages"]): boolean {
 /**
  * Extract the user's prompt text from messages for classification.
  */
-function extractPromptForClassification(messages: ChatRequest["messages"]): {
+type ConversationContext = {
   prompt: string;
   systemPrompt: string | undefined;
-} {
+  /** Number of user+assistant turn pairs */
+  turns: number;
+  /** Minimum tier based on conversation history signals */
+  floorTier: "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
+  /** Why the floor was set (empty if SIMPLE / no escalation) */
+  floorReason: string;
+};
+
+const TIER_RANK: Record<string, number> = { SIMPLE: 0, MEDIUM: 1, COMPLEX: 2, REASONING: 3 };
+const RANK_TIER = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"] as const;
+
+function extractPromptForClassification(messages: ChatRequest["messages"]): ConversationContext {
   let systemPrompt: string | undefined;
   let lastUserMsg = "";
+  let turns = 0;
+
+  // Signals collected from conversation history (excluding last user message)
+  let historyCodeBlocks = 0;
+  let historyLongAssistantMsgs = 0;
+  let historyReasoningSignals = 0;
+  let historyToolCalls = 0;
+  let totalAssistantTokensEst = 0;
+
+  const reasoningPatterns = /\b(step \d|therefore|because|thus|hence|proof|theorem|algorithm|O\(n|complexity)\b/i;
+  const codeBlockPattern = /```[\s\S]*?```/g;
 
   for (const msg of messages) {
     const text = typeof msg.content === "string"
@@ -97,11 +121,75 @@ function extractPromptForClassification(messages: ChatRequest["messages"]): {
     if (msg.role === "system" || msg.role === "developer") {
       systemPrompt = (systemPrompt ? systemPrompt + "\n" : "") + text;
     } else if (msg.role === "user") {
+      // Before overwriting, the previous lastUserMsg is "history"
+      if (lastUserMsg) turns++;
       lastUserMsg = text;
+    } else if (msg.role === "assistant") {
+      // Analyze assistant response complexity
+      const codeMatches = text.match(codeBlockPattern);
+      if (codeMatches) historyCodeBlocks += codeMatches.length;
+      if (text.length > 2000) historyLongAssistantMsgs++;
+      if (reasoningPatterns.test(text)) historyReasoningSignals++;
+      totalAssistantTokensEst += Math.ceil(text.length / 4);
+      // Check for tool_call content blocks
+      if (typeof msg.content !== "string" && Array.isArray(msg.content)) {
+        if (msg.content.some(b => b.type === "tool_use" || b.type === "tool_calls")) {
+          historyToolCalls++;
+        }
+      }
     }
   }
 
-  return { prompt: lastUserMsg, systemPrompt };
+  // Compute conversation floor tier
+  let floorRank = 0; // SIMPLE
+  const reasons: string[] = [];
+
+  // Multi-turn conversations with code are at least MEDIUM
+  if (turns >= 2 && historyCodeBlocks >= 1) {
+    floorRank = Math.max(floorRank, 1);
+    reasons.push(`${historyCodeBlocks} code blocks in history`);
+  }
+
+  // Long assistant responses suggest complex work
+  if (historyLongAssistantMsgs >= 2) {
+    floorRank = Math.max(floorRank, 2);
+    reasons.push(`${historyLongAssistantMsgs} long responses`);
+  } else if (historyLongAssistantMsgs >= 1 && turns >= 3) {
+    floorRank = Math.max(floorRank, 1);
+    reasons.push("long response in multi-turn");
+  }
+
+  // Reasoning patterns in assistant history
+  if (historyReasoningSignals >= 2) {
+    floorRank = Math.max(floorRank, 2);
+    reasons.push(`${historyReasoningSignals} reasoning signals`);
+  }
+
+  // Heavy code conversations (3+ code blocks) are at least COMPLEX
+  if (historyCodeBlocks >= 3) {
+    floorRank = Math.max(floorRank, 2);
+    reasons.push("heavy code conversation");
+  }
+
+  // Tool-using conversations stay at MEDIUM minimum
+  if (historyToolCalls >= 1) {
+    floorRank = Math.max(floorRank, 1);
+    reasons.push(`${historyToolCalls} tool calls in history`);
+  }
+
+  // Very long total assistant output suggests sustained complex work
+  if (totalAssistantTokensEst > 8000) {
+    floorRank = Math.max(floorRank, 2);
+    reasons.push(`~${(totalAssistantTokensEst / 1000).toFixed(0)}k assistant tokens`);
+  }
+
+  return {
+    prompt: lastUserMsg,
+    systemPrompt,
+    turns,
+    floorTier: RANK_TIER[floorRank],
+    floorReason: reasons.join(", "),
+  };
 }
 
 
@@ -185,8 +273,8 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
   const stream = chatReq.stream ?? false;
   const maxTokens = chatReq.max_tokens ?? 4096;
 
-  // Extract prompt for classification
-  const { prompt, systemPrompt } = extractPromptForClassification(chatReq.messages);
+  // Extract prompt + conversation context for classification
+  const { prompt, systemPrompt, turns, floorTier, floorReason } = extractPromptForClassification(chatReq.messages);
 
   if (!prompt) {
     return sendError(res, 400, "No user message found");
@@ -244,6 +332,20 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
       classifierConfidence = decision.confidence;
       if (hasTools) override = "tools";
 
+      // Apply conversation floor — don't downgrade mid-conversation
+      const classifiedRank = TIER_RANK[tier] ?? 0;
+      const floorRank = TIER_RANK[floorTier] ?? 0;
+      if (floorRank > classifiedRank && turns >= 2) {
+        const prevTier = tier;
+        tier = floorTier;
+        // Re-select model for the upgraded tier
+        const floorTierMap = (hasTools && routingCfg.agenticTiers) ? routingCfg.agenticTiers : routingCfg.tiers;
+        const floorTierConfig = floorTierMap[tier as keyof typeof floorTierMap];
+        if (floorTierConfig?.primary) routedModel = floorTierConfig.primary;
+        reasoning += ` | conv-floor: ${prevTier}→${tier} (${floorReason})`;
+        override = "conv-floor" as RouteOverride;
+      }
+
       logger.info(`[${stats.requests + 1}] Classified: tier=${tier} model=${routedModel} confidence=${decision.confidence.toFixed(2)} | ${reasoning}`);
     }
     }
@@ -266,6 +368,15 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
   const estInputTokens = (prompt.length + (systemPrompt ?? "").length) / 4;
   const estInputCostUsd = ppqPrice ? (estInputTokens / 1e6) * ppqPrice.inputPerM : undefined;
 
+  // ─── Budget gate ───
+  const spendCheck = await canSpend(estInputCostUsd ?? 0);
+  if (!spendCheck.allowed) {
+    logger.warn(`[${stats.requests}] BLOCKED by spend limit: ${spendCheck.reason}`);
+    return sendError(res, 429, spendCheck.reason ?? "Budget exceeded", "budget_exceeded");
+  }
+  // Track this request's estimated cost between PPQ syncs
+  if (estInputCostUsd) recordEstimatedCost(estInputCostUsd);
+
   // Persist per-request decision (fire-and-forget, never blocks the request)
   void logRoutingDecision({
     ts: new Date().toISOString(),
@@ -281,6 +392,8 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
     imagePresent: imagesPresent,
     systemPromptLen: (systemPrompt ?? "").length,
     estInputCostUsd,
+    convTurns: turns,
+    convFloor: floorTier !== "SIMPLE" ? floorTier : undefined,
   });
 
   // Add routing info headers
@@ -391,10 +504,11 @@ function handleHealth(_req: IncomingMessage, res: ServerResponse) {
 async function handleStats(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? "/stats", "http://x");
   const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get("limit") ?? "50", 10) || 50));
-  const [recent, ppq, pinch] = await Promise.all([
+  const [recent, ppq, pinch, spend] = await Promise.all([
     readRecentDecisions(limit),
     getPpqSnapshot(),
     getPinchbench(),
+    getSpendState(),
   ]);
 
   // Cross-reference current config against pinchbench leaderboard.
@@ -471,6 +585,10 @@ async function handleStats(req: IncomingMessage, res: ServerResponse) {
     windowByOverride[r.override] = (windowByOverride[r.override] ?? 0) + 1;
   }
 
+  // Score routing decisions against PPQ actuals
+  const boundaries = cfg.tierBoundaries ?? { simpleMedium: 0, mediumComplex: 0, complexReasoning: 0 };
+  const feedback = scoreBatch(enriched, boundaries);
+
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
     ...stats,
@@ -483,6 +601,8 @@ async function handleStats(req: IncomingMessage, res: ServerResponse) {
     },
     recent: enriched,
     ppq,
+    spend,
+    feedback,
     pinch: {
       fetchedAt: pinch.fetchedAt,
       totalModels: pinch.rows.length,
@@ -609,6 +729,12 @@ button.add{background:#1f2937;color:#93c5fd;border:1px dashed #374151;padding:.2
     <label style="flex:2">enabled models (one per line)<textarea id="th_enabled"></textarea></label>
     <label style="flex:1;min-width:100px">budget (tokens)<input type="number" id="th_budget" step="256" min="0"></label>
   </div></div>
+  <h2>spend limits <span class="meta">budget enforcement — leave blank to disable</span></h2>
+  <div class="card"><div class="row">
+    <label>daily limit (USD)<input type="number" id="sl_daily" step="0.50" min="0" placeholder="e.g. 10.00"></label>
+    <label>monthly limit (USD)<input type="number" id="sl_monthly" step="1" min="0" placeholder="e.g. 100.00"></label>
+    <label>action when exceeded<select id="sl_action"><option value="block">block (429)</option><option value="warn">warn (log only)</option></select></label>
+  </div></div>
 </div>
 <div style="margin-top:.75rem">
   <button id="save" disabled>save + reload</button>
@@ -649,6 +775,51 @@ button.add{background:#1f2937;color:#93c5fd;border:1px dashed #374151;padding:.2
   <div class="meta" style="margin-top:.5rem">cost by model (last 24h)</div>
   <div id="ppq_byModel" style="margin:.25rem 0;font:12px/1.5 ui-monospace,monospace"></div>
   <div class="meta" id="ppq_err" style="color:#fca5a5;display:none"></div>
+</div>
+<div id="budgetPanel" class="card" style="padding:.75rem;margin-bottom:.75rem" hidden>
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <h2 style="margin:0">spend budget</h2>
+    <span class="meta" id="bgt_sync">—</span>
+  </div>
+  <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin:.5rem 0">
+    <div style="flex:1;min-width:200px">
+      <div class="meta">daily spend</div>
+      <div id="bgt_daily" style="font:600 20px/1 system-ui">—</div>
+      <div style="margin:.35rem 0;background:#0f1115;border-radius:4px;height:10px;overflow:hidden"><div id="bgt_dailyBar" style="height:100%;border-radius:4px;transition:width .3s"></div></div>
+      <div class="meta" id="bgt_dailyLabel">—</div>
+    </div>
+    <div style="flex:1;min-width:200px">
+      <div class="meta">monthly spend</div>
+      <div id="bgt_monthly" style="font:600 20px/1 system-ui">—</div>
+      <div style="margin:.35rem 0;background:#0f1115;border-radius:4px;height:10px;overflow:hidden"><div id="bgt_monthlyBar" style="height:100%;border-radius:4px;transition:width .3s"></div></div>
+      <div class="meta" id="bgt_monthlyLabel">—</div>
+    </div>
+    <div>
+      <div class="meta">burn rate</div>
+      <div id="bgt_burn" style="font:600 20px/1 system-ui">—</div>
+      <div class="meta">per hour</div>
+    </div>
+    <div>
+      <div class="meta">action</div>
+      <div id="bgt_action" style="font:600 14px/1.4 system-ui;text-transform:uppercase">—</div>
+    </div>
+  </div>
+</div>
+<div id="feedbackPanel" class="card" style="padding:.75rem;margin-bottom:.75rem" hidden>
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <h2 style="margin:0">classification accuracy</h2>
+    <span class="meta" id="fb_meta">—</span>
+  </div>
+  <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin:.5rem 0">
+    <div><div class="meta">accuracy</div><div id="fb_accuracy" style="font:600 20px/1 system-ui">—</div></div>
+    <div><div class="meta">correct</div><div id="fb_correct" style="font:600 20px/1 system-ui;color:#34d399">—</div></div>
+    <div><div class="meta">over-classified</div><div id="fb_over" style="font:600 20px/1 system-ui;color:#fbbf24">—</div></div>
+    <div><div class="meta">under-classified</div><div id="fb_under" style="font:600 20px/1 system-ui;color:#fca5a5">—</div></div>
+    <div><div class="meta">wasted spend</div><div id="fb_wasted" style="font:600 20px/1 system-ui;color:#fbbf24">—</div></div>
+  </div>
+  <div class="meta" style="margin-top:.5rem">per-tier accuracy (based on PPQ actual output tokens)</div>
+  <div id="fb_tierBars" style="margin:.25rem 0"></div>
+  <div id="fb_suggestions" style="margin-top:.5rem" hidden></div>
 </div>
 <div id="pinchPanel" class="card" style="padding:.75rem;margin-bottom:.75rem">
   <div style="display:flex;justify-content:space-between;align-items:baseline">
@@ -815,6 +986,17 @@ function buildForm(){
   const bud=document.getElementById('th_budget');
   bud.value=workingCfg.thinking.enabled.budget??4096;
   bud.oninput=()=>{workingCfg.thinking.enabled.budget=parseInt(bud.value)||0};
+  // Spend limits
+  workingCfg.spendLimits=workingCfg.spendLimits||{};
+  const slD=document.getElementById('sl_daily');
+  slD.value=workingCfg.spendLimits.daily??'';
+  slD.oninput=()=>{const n=parseFloat(slD.value);workingCfg.spendLimits.daily=Number.isFinite(n)&&n>0?n:undefined};
+  const slM=document.getElementById('sl_monthly');
+  slM.value=workingCfg.spendLimits.monthly??'';
+  slM.oninput=()=>{const n=parseFloat(slM.value);workingCfg.spendLimits.monthly=Number.isFinite(n)&&n>0?n:undefined};
+  const slA=document.getElementById('sl_action');
+  slA.value=workingCfg.spendLimits.action||'block';
+  slA.onchange=()=>{workingCfg.spendLimits.action=slA.value};
   ed.value=JSON.stringify(lastCfg,null,2);
 }
 async function load(){
@@ -861,6 +1043,114 @@ async function loadStats(){
       else errEl.style.display='none';
     }else{
       ppqPanel.hidden=true;
+    }
+
+    // Budget panel
+    const spend=j.spend;
+    const budgetPanel=document.getElementById('budgetPanel');
+    if(spend&&spend.limits){
+      budgetPanel.hidden=false;
+      const lim=spend.limits;
+      const syncEl=document.getElementById('bgt_sync');
+      try{syncEl.textContent=spend.lastSync?'synced '+new Date(spend.lastSync).toTimeString().slice(0,8):'no ppq sync'}catch(e){syncEl.textContent='—'}
+
+      const statusColor={ok:'#34d399',warning:'#fbbf24',exceeded:'#fca5a5'};
+
+      // Daily
+      const dailyEl=document.getElementById('bgt_daily');
+      dailyEl.textContent='$'+spend.dailySpend.toFixed(4);
+      dailyEl.style.color=statusColor[spend.dailyStatus]||'#e6e6e6';
+      const dailyBar=document.getElementById('bgt_dailyBar');
+      const dailyLabel=document.getElementById('bgt_dailyLabel');
+      if(lim.daily){
+        const pct=Math.min(100,spend.dailySpend/lim.daily*100);
+        dailyBar.style.width=pct.toFixed(1)+'%';
+        dailyBar.style.background=statusColor[spend.dailyStatus]||'#34d399';
+        dailyLabel.textContent='$'+spend.dailySpend.toFixed(2)+' / $'+lim.daily.toFixed(2)+' ('+pct.toFixed(0)+'%)';
+      }else{
+        dailyBar.style.width='0%';
+        dailyLabel.textContent='no daily limit set';
+      }
+
+      // Monthly
+      const monthlyEl=document.getElementById('bgt_monthly');
+      monthlyEl.textContent='$'+spend.monthlySpend.toFixed(4);
+      monthlyEl.style.color=statusColor[spend.monthlyStatus]||'#e6e6e6';
+      const monthlyBar=document.getElementById('bgt_monthlyBar');
+      const monthlyLabel=document.getElementById('bgt_monthlyLabel');
+      if(lim.monthly){
+        const pct=Math.min(100,spend.monthlySpend/lim.monthly*100);
+        monthlyBar.style.width=pct.toFixed(1)+'%';
+        monthlyBar.style.background=statusColor[spend.monthlyStatus]||'#34d399';
+        monthlyLabel.textContent='$'+spend.monthlySpend.toFixed(2)+' / $'+lim.monthly.toFixed(2)+' ('+pct.toFixed(0)+'%)';
+      }else{
+        monthlyBar.style.width='0%';
+        monthlyLabel.textContent='no monthly limit set';
+      }
+
+      // Burn rate
+      document.getElementById('bgt_burn').textContent=spend.burnRatePerHour>0?'$'+spend.burnRatePerHour.toFixed(4):'—';
+
+      // Action
+      const actionEl=document.getElementById('bgt_action');
+      actionEl.textContent=lim.action||'warn';
+      actionEl.style.color=lim.action==='block'?'#fca5a5':'#fbbf24';
+    }else{
+      budgetPanel.hidden=true;
+    }
+
+    // Feedback / classification accuracy
+    const fb=j.feedback;
+    const fbPanel=document.getElementById('feedbackPanel');
+    if(fb&&fb.scored>0){
+      fbPanel.hidden=false;
+      document.getElementById('fb_meta').textContent=fb.scored+' scored, '+fb.unscored+' without PPQ data';
+      const accPct=(fb.accuracy*100).toFixed(0)+'%';
+      const accEl=document.getElementById('fb_accuracy');
+      accEl.textContent=accPct;
+      accEl.style.color=fb.accuracy>=0.7?'#34d399':fb.accuracy>=0.5?'#fbbf24':'#fca5a5';
+      document.getElementById('fb_correct').textContent=fb.correct;
+      document.getElementById('fb_over').textContent=fb.over;
+      document.getElementById('fb_under').textContent=fb.under;
+      document.getElementById('fb_wasted').textContent='$'+fb.wastedUsd.toFixed(4);
+
+      // Per-tier bars
+      const tierBars=document.getElementById('fb_tierBars');tierBars.innerHTML='';
+      const tierOrder=['SIMPLE','MEDIUM','COMPLEX','REASONING'];
+      for(const t of tierOrder){
+        const ts=fb.byTier[t];
+        if(!ts||!ts.scored)continue;
+        const correctPct=(ts.correct/ts.scored*100).toFixed(0);
+        const overPct=(ts.over/ts.scored*100).toFixed(0);
+        const underPct=(ts.under/ts.scored*100).toFixed(0);
+        const row=document.createElement('div');
+        row.style.cssText='display:flex;align-items:center;gap:.5rem;margin:.15rem 0;font:12px/1 ui-monospace,monospace';
+        row.innerHTML='<div style="width:90px;color:#9db2c7">'+t+'</div>'+
+          '<div style="flex:1;background:#0f1115;border-radius:2px;overflow:hidden;height:14px;display:flex">'+
+            '<div style="width:'+correctPct+'%;height:100%;background:#34d399" title="correct '+correctPct+'%"></div>'+
+            '<div style="width:'+overPct+'%;height:100%;background:#fbbf24" title="over '+overPct+'%"></div>'+
+            '<div style="width:'+underPct+'%;height:100%;background:#fca5a5" title="under '+underPct+'%"></div>'+
+          '</div>'+
+          '<div style="width:90px;text-align:right">'+ts.scored+' ('+correctPct+'% ok)</div>';
+        tierBars.appendChild(row);
+      }
+
+      // Suggestions
+      const sugBox=document.getElementById('fb_suggestions');
+      if(fb.suggestions&&fb.suggestions.length>0){
+        sugBox.hidden=false;
+        sugBox.innerHTML='<div class="meta" style="margin-bottom:.25rem">suggestions</div>'+
+          fb.suggestions.map(function(s){
+            return '<div class="tip" style="margin:.25rem 0"><b>'+s.direction+' '+s.boundary+'</b> from '+
+              s.currentValue.toFixed(2)+' to '+s.suggestedValue.toFixed(2)+
+              ' — '+escHtml(s.reason)+
+              (s.estimatedSavingsUsd>0?' (save ~$'+s.estimatedSavingsUsd.toFixed(4)+')':'')+'</div>';
+          }).join('');
+      }else{
+        sugBox.hidden=true;
+      }
+    }else{
+      fbPanel.hidden=true;
     }
 
     // Pinchbench config comparison
@@ -1025,6 +1315,10 @@ function cleanCfg(c){
     const p=(c.visionTier.primary||'').trim();
     if(!p){delete c.visionTier}
     else{c.visionTier.primary=p;c.visionTier.fallback=(c.visionTier.fallback||[]).filter(s=>s&&s.trim())}
+  }
+  if(c.spendLimits){
+    if(!c.spendLimits.daily&&!c.spendLimits.monthly){delete c.spendLimits}
+    else{c.spendLimits.action=c.spendLimits.action||'block'}
   }
   return c;
 }

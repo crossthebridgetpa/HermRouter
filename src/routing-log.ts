@@ -11,7 +11,7 @@ import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type RouteOverride = "none" | "vision" | "mode" | "tools" | "explicit";
+export type RouteOverride = "none" | "vision" | "mode" | "tools" | "explicit" | "conv-floor";
 
 export type RouteLogEntry = {
   ts: string;
@@ -28,6 +28,10 @@ export type RouteLogEntry = {
   systemPromptLen: number;
   /** Estimated input cost (USD) based on promptLen chars / 4 ≈ tokens + PPQ pricing. */
   estInputCostUsd?: number;
+  /** Number of user+assistant turn pairs in the conversation */
+  convTurns?: number;
+  /** Conversation floor tier (omitted if SIMPLE / no escalation) */
+  convFloor?: string;
 };
 
 const LOG_DIR = join(homedir(), ".freerouter");
