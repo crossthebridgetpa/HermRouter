@@ -1,5 +1,5 @@
 /**
- * FreeRouter routing decision log.
+ * HermRouter routing decision log.
  *
  * Appends one JSON line per request to ~/.freerouter/routing.jsonl so the
  * `/stats` endpoint (and UI panel) can show why each request was routed the

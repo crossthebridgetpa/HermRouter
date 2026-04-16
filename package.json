@@ -1,7 +1,7 @@
 {
-  "name": "freerouter",
-  "version": "1.0.0",
-  "description": "Free, self-hosted AI model router — smart routing with your own API keys (OpenRouter alternative)",
+  "name": "hermrouter",
+  "version": "1.4.0",
+  "description": "Self-hosted LLM proxy — 14-dimension classifier routes requests to the right model automatically",
   "type": "module",
   "main": "src/index.ts",
   "scripts": {

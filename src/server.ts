@@ -1,5 +1,5 @@
 /**
- * ClawRouter Proxy Server
+ * HermRouter Proxy Server
  *
  * OpenAI-compatible HTTP server that classifies incoming requests
  * using the 14-dimension weighted scorer and routes to the best backend.
@@ -483,7 +483,7 @@ function handleReloadConfig(_req: IncomingMessage, res: ServerResponse) {
 }
 
 const UI_HTML = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>freerouter config</title>
+<html lang="en"><head><meta charset="utf-8"><title>HermRouter config</title>
 <style>
 body{font:14px/1.4 system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;background:#0f1115;color:#e6e6e6}
 h1{font-size:18px;margin:0 0 .5rem} h2{font-size:14px;margin:1rem 0 .5rem;color:#9db2c7}
@@ -531,7 +531,7 @@ button.add{background:#1f2937;color:#93c5fd;border:1px dashed #374151;padding:.2
 .tip b{color:#93c5fd}
 .tip code{background:#0f1115;padding:0 .25rem;border-radius:2px;color:#fbbf24}
 </style></head><body>
-<h1>freerouter</h1>
+<h1>HermRouter</h1>
 <div class="meta" id="meta">loading…</div>
 <nav class="tabnav">
   <button id="tabBtnConfig" class="active" type="button">config</button>
@@ -540,7 +540,7 @@ button.add{background:#1f2937;color:#93c5fd;border:1px dashed #374151;padding:.2
 <div id="tabConfig">
 <details><summary>how this works (click to expand)</summary>
 <div style="padding:.5rem .75rem;background:#1a1d24;border-radius:4px;color:#cbd5e1">
-<p style="margin:.25rem 0"><b>What it does.</b> freerouter classifies each incoming prompt on 14 dimensions, scores complexity 0–1, and routes to one of four tiers: <code>SIMPLE</code>, <code>MEDIUM</code>, <code>COMPLEX</code>, <code>REASONING</code>. Each tier names a <code>primary</code> model and an ordered <code>fallback</code> list used on error.</p>
+<p style="margin:.25rem 0"><b>What it does.</b> HermRouter classifies each incoming prompt on 14 dimensions, scores complexity 0–1, and routes to one of four tiers: <code>SIMPLE</code>, <code>MEDIUM</code>, <code>COMPLEX</code>, <code>REASONING</code>. Each tier names a <code>primary</code> model and an ordered <code>fallback</code> list used on error.</p>
 <p style="margin:.25rem 0"><b>Tier boundaries.</b> <code>tierBoundaries</code> holds three cut points on the 0–1 score. Score &lt; <code>simpleMedium</code> → SIMPLE; &lt; <code>mediumComplex</code> → MEDIUM; &lt; <code>complexReasoning</code> → COMPLEX; otherwise REASONING. Raise a boundary to push more traffic into the cheaper tier below it.</p>
 <p style="margin:.25rem 0"><b>Tools vs. chat.</b> <code>tiers</code> is for plain chat. <code>agenticTiers</code> overrides when the request contains tool calls — use it to force models with solid tool-use on agent workloads.</p>
 <p style="margin:.25rem 0"><b>Model IDs.</b> Always <code>&lt;provider&gt;/&lt;model&gt;</code>. <code>provider</code> must exist under <code>providers</code> in this config; <code>model</code> is passed upstream verbatim, slashes and all (e.g. <code>ppq/openai/gpt-5.2-pro</code>). Expand the PPQ model list below to copy valid IDs.</p>
@@ -597,7 +597,7 @@ button.add{background:#1f2937;color:#93c5fd;border:1px dashed #374151;padding:.2
 <div id="models">not loaded</div></details>
 </div>
 <div id="tabStats" hidden>
-<div class="meta" style="margin:.25rem 0">auto-refreshes every 5 seconds — every request freerouter handles is logged to <code id="s_logPathInline">~/.freerouter/routing.jsonl</code></div>
+<div class="meta" style="margin:.25rem 0">auto-refreshes every 5 seconds — every request HermRouter handles is logged to <code id="s_logPathInline">~/.freerouter/routing.jsonl</code></div>
 <div id="ppqPanel" class="card" style="padding:.75rem;margin-bottom:.75rem" hidden>
   <div style="display:flex;justify-content:space-between;align-items:baseline">
     <h2 style="margin:0">ppq account activity</h2>
@@ -1259,7 +1259,7 @@ if (process.argv.includes("--debug")) {
 const server = createServer(handleRequest);
 
 server.listen(PORT, HOST, () => {
-  logger.info(`🚀 ClawRouter proxy listening on http://${HOST}:${PORT} (config: ${getConfigPath() ?? "built-in defaults"})`);
+  logger.info(`🚀 HermRouter proxy listening on http://${HOST}:${PORT} (config: ${getConfigPath() ?? "built-in defaults"})`);
   logger.info(`   POST /v1/chat/completions  — route & forward`);
   logger.info(`   GET  /v1/models            — list models`);
   logger.info(`   GET  /health               — health check`);

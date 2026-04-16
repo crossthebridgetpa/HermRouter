@@ -1,5 +1,5 @@
 /**
- * ClawRouter — Direct API Edition
+ * HermRouter — Direct API Edition
  * Forked from BlockRunAI/ClawRouter (MIT License).
  *
  * Smart 14-dimension weighted routing WITHOUT x402/BlockRun/wallet.

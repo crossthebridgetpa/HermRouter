@@ -1,5 +1,5 @@
 /**
- * FreeRouter Auth — loads credentials from Hermes Agent's credential pool
+ * HermRouter Auth — loads credentials from Hermes Agent's credential pool
  * (~/.hermes/auth.json). Zero-dep. Per-provider env-var overrides are still
  * honored via freerouter.config.json (`providers.<name>.auth.type = "env"`).
  */

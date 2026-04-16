@@ -1,5 +1,5 @@
 /**
- * ClawRouter Config — loads external configuration from freerouter.config.json
+ * HermRouter Config — loads external configuration from freerouter.config.json
  * Zero external deps. Falls back to hardcoded defaults if no config file exists.
  *
  * Config file search order:
