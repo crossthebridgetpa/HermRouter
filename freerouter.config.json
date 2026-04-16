@@ -38,7 +38,7 @@
       ]
     },
     "COMPLEX": {
-      "primary": "ppq/claude-sonnet-4.6",
+      "primary": "ppq/qwen/qwen3.6-plus",
       "fallback": [
         "ppq/gpt-5.4",
         "ppq/qwen/qwen3.5-flash-02-23"
@@ -104,5 +104,10 @@
   "visionTier": {
     "primary": "ppq/qwen/qwen3.6-plus",
     "fallback": []
+  },
+  "spendLimits": {
+    "daily": 10.00,
+    "monthly": 100.00,
+    "action": "block"
   }
 }

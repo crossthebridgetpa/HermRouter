@@ -41,6 +41,12 @@ export type ThinkingConfig = {
   enabled?: { models: string[]; budget: number };
 };
 
+export type SpendLimits = {
+  daily?: number;       // USD cap per calendar day
+  monthly?: number;     // USD cap per calendar month
+  action: "block" | "warn";  // block = reject with 429, warn = log and allow
+};
+
 export type FreeRouterConfig = {
   port: number;
   host: string;
@@ -54,6 +60,7 @@ export type FreeRouterConfig = {
     complexReasoning: number;
   };
   thinking?: ThinkingConfig;
+  spendLimits?: SpendLimits;
   auth: {
     default: string;
     [strategy: string]: unknown;
