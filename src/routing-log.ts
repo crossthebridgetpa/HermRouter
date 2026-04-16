@@ -26,6 +26,8 @@ export type RouteLogEntry = {
   toolCount: number;
   imagePresent: boolean;
   systemPromptLen: number;
+  /** Estimated input cost (USD) based on promptLen chars / 4 ≈ tokens + PPQ pricing. */
+  estInputCostUsd?: number;
 };
 
 const LOG_DIR = join(homedir(), ".freerouter");

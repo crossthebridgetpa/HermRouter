@@ -261,6 +261,11 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
   stats.byTier[tier] = (stats.byTier[tier] ?? 0) + 1;
   stats.byModel[routedModel] = (stats.byModel[routedModel] ?? 0) + 1;
 
+  // Estimate input cost from char-length (chars / 4 ≈ tokens) + PPQ pricing
+  const ppqPrice = findPpqPrice(routedModel);
+  const estInputTokens = (prompt.length + (systemPrompt ?? "").length) / 4;
+  const estInputCostUsd = ppqPrice ? (estInputTokens / 1e6) * ppqPrice.inputPerM : undefined;
+
   // Persist per-request decision (fire-and-forget, never blocks the request)
   void logRoutingDecision({
     ts: new Date().toISOString(),
@@ -275,6 +280,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
     toolCount: Array.isArray(chatReq.tools) ? chatReq.tools.length : 0,
     imagePresent: imagesPresent,
     systemPromptLen: (systemPrompt ?? "").length,
+    estInputCostUsd,
   });
 
   // Add routing info headers
@@ -648,7 +654,7 @@ button.add{background:#1f2937;color:#93c5fd;border:1px dashed #374151;padding:.2
   <div class="meta" style="margin-top:.5rem">recent decisions</div>
   <div style="max-height:360px;overflow:auto;background:#0f1115;border:1px solid #2a2f3a;border-radius:4px">
   <table class="mtab" style="width:100%"><thead><tr>
-    <th>time</th><th>tier</th><th>model</th><th>override</th><th style="text-align:right">conf</th><th>reasoning</th>
+    <th>time</th><th>tier</th><th>model</th><th>override</th><th style="text-align:right">conf</th><th style="text-align:right">est. cost</th><th>reasoning</th>
   </tr></thead><tbody id="s_rows"></tbody></table>
   </div>
   <div class="meta" style="margin-top:.5rem">log file: <span id="s_logPath">—</span></div>
@@ -896,11 +902,13 @@ async function loadStats(){
       const conf=d.classifierConfidence==null?'—':(d.classifierConfidence*100).toFixed(0)+'%';
       const color=TIER_COLORS[d.tier]||'#9db2c7';
       const tr=document.createElement('tr');
+      const cost=d.estInputCostUsd!=null?'$'+d.estInputCostUsd.toFixed(4):'—';
       tr.innerHTML='<td>'+escHtml(tStr)+'</td>'+
         '<td style="color:'+color+';font-weight:600">'+escHtml(d.tier)+'</td>'+
         '<td>'+escHtml(d.routedModel)+'</td>'+
         '<td class="mprov">'+escHtml(d.override)+'</td>'+
         '<td style="text-align:right">'+conf+'</td>'+
+        '<td style="text-align:right;color:#34d399;font-variant-numeric:tabular-nums">'+cost+'</td>'+
         '<td class="mprov" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escHtml(d.reasoning)+'">'+escHtml(d.reasoning)+'</td>';
       rows.appendChild(tr);
     }
